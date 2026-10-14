@@ -1,0 +1,4 @@
+# Copy to .dev.vars (which is git-ignored) for `wrangler dev`, then fill in.
+# Never commit real values.
+DISCORD_USER_TOKEN=
+SERVER_SECRET=

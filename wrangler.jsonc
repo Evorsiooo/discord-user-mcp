@@ -1,0 +1,10 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "discord-user-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  // Secrets (DISCORD_USER_TOKEN, SERVER_SECRET) are set with `wrangler secret put`,
+  // never here. Workers Logs stays off so request data is not retained.
+  "observability": { "enabled": false }
+}
