@@ -151,7 +151,14 @@ export function createServer(discord: DiscordClient): McpServer {
           }
           throw error;
         }
-        if (messages.length === 0) return text("No messages.");
+        if (messages.length === 0) {
+          // Discord answers a forum or media channel with an empty list, not an error.
+          const channel = await discord.getChannel(channel_id).catch(() => undefined);
+          if (channel?.type === 15 || channel?.type === 16) {
+            return text(`Channel ${channel.name ?? channel_id} is a forum/media channel, so it has no messages of its own. Call list_threads on it, then read_messages with a thread id.`);
+          }
+          return text("No messages.");
+        }
         const lines = messages
           .slice()
           .sort((a, b) => compareSnowflakes(a.id, b.id))

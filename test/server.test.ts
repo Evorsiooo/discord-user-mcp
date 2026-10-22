@@ -288,10 +288,16 @@ describe("forum channels", () => {
     expect(notForum.isError).toBe(true);
     expect(notForum.content[0]!.text).toContain("not a forum");
 
-    const forum = fakeDiscord(() => json({ code: 50024, message: "Cannot execute action on this channel type" }, 400));
+    const forum = fakeDiscord((c) => (c.url.includes("/messages") ? json([]) : json({ id: FORUM, type: 15, name: "help-posts" })));
     const read = await callTool(forum.client, "read_messages", { channel_id: FORUM });
-    expect(read.isError).toBe(true);
+    expect(read.isError).toBeFalsy();
     expect(read.content[0]!.text).toContain("list_threads");
+
+    const emptyText = fakeDiscord((c) => (c.url.includes("/messages") ? json([]) : json({ id: CHANNEL, type: 0, name: "chat" })));
+    expect((await callTool(emptyText.client, "read_messages", { channel_id: CHANNEL })).content[0]!.text).toBe("No messages.");
+
+    const legacy = fakeDiscord(() => json({ code: 50024, message: "Cannot execute action on this channel type" }, 400));
+    expect((await callTool(legacy.client, "read_messages", { channel_id: FORUM })).content[0]!.text).toContain("list_threads");
   });
 });
 
