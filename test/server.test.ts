@@ -208,3 +208,163 @@ describe("helpers", () => {
     expect(checkTextStart("", "", "x")).toBeNull();
   });
 });
+
+const FORUM = "444444444444444444";
+const THREAD = "555555555555555555";
+const CDN = "https://cdn.discordapp.com/attachments/111111111111111111/666666666666666666/memo.png?ex=1&is=2&hm=3&";
+const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+
+const imageResponse = (bytes: Uint8Array, type = "image/png") =>
+  new Response(bytes, { headers: { "Content-Type": type, "Content-Length": String(bytes.length) } });
+
+describe("forum channels", () => {
+  it("lists forum and media channels in list_channels", async () => {
+    const { client } = fakeDiscord(() =>
+      json([
+        { id: "1", type: 0, name: "chat", position: 0 },
+        { id: FORUM, type: 15, name: "help-posts", position: 1 },
+        { id: "2", type: 16, name: "art", position: 2 },
+        { id: "3", type: 2, name: "voice", position: 3 },
+      ]),
+    );
+    const rows = JSON.parse((await callTool(client, "list_channels", { guild_id: CHANNEL })).content[0]!.text);
+    expect(rows.map((r: { type: string }) => r.type)).toEqual(["text", "forum", "media"]);
+  });
+
+  it("lists posts with tag names and a first-post preview", async () => {
+    const { client, calls } = fakeDiscord((c) =>
+      c.url.includes("/threads/search")
+        ? json({
+            threads: [
+              {
+                id: THREAD,
+                type: 11,
+                name: "How do I deploy?",
+                parent_id: FORUM,
+                applied_tags: ["t1"],
+                message_count: 4,
+                last_message_id: "1562644070222925894",
+                thread_metadata: { archived: true, create_timestamp: "2026-10-01T00:00:00+00:00" },
+              },
+            ],
+            first_messages: [{ ...message, id: THREAD, channel_id: THREAD, content: "Question body" }],
+            has_more: true,
+            total_results: 9,
+          })
+        : json({ id: FORUM, type: 15, name: "help-posts", guild_id: CHANNEL, available_tags: [{ id: "t1", name: "Solved" }] }),
+    );
+    const result = await callTool(client, "list_threads", { channel_id: FORUM });
+    expect(result.isError).toBeFalsy();
+    const [header, line, more] = result.content[0]!.text.split("\n");
+    expect(header).toContain("posts 1-1 of 9");
+    expect(JSON.parse(line!)).toMatchObject({
+      thread_id: THREAD,
+      name: "How do I deploy?",
+      tags: ["Solved"],
+      archived: true,
+      started_by: "alice",
+      first_post: "Question body",
+    });
+    expect(more).toContain("offset 1");
+    expect(calls[1]!.url).toContain("sort_by=last_message_time");
+  });
+
+  it("falls back to active threads when the search endpoint is refused", async () => {
+    const { client } = fakeDiscord((c) => {
+      if (c.url.includes("/threads/search")) return json({ code: 0, message: "403: Forbidden" }, 403);
+      if (c.url.includes("/threads/active")) {
+        return json({ threads: [{ id: THREAD, type: 11, name: "Active post", parent_id: FORUM }, { id: "9", type: 11, name: "Other forum", parent_id: "8" }] });
+      }
+      return json({ id: FORUM, type: 15, name: "help-posts", guild_id: CHANNEL });
+    });
+    const text = (await callTool(client, "list_threads", { channel_id: FORUM })).content[0]!.text;
+    expect(text).toContain("Active post");
+    expect(text).not.toContain("Other forum");
+  });
+
+  it("refuses ordinary channels and hints at list_threads for forums", async () => {
+    const plain = fakeDiscord(() => json({ id: CHANNEL, type: 0, name: "chat" }));
+    const notForum = await callTool(plain.client, "list_threads", { channel_id: CHANNEL });
+    expect(notForum.isError).toBe(true);
+    expect(notForum.content[0]!.text).toContain("not a forum");
+
+    const forum = fakeDiscord(() => json({ code: 50024, message: "Cannot execute action on this channel type" }, 400));
+    const read = await callTool(forum.client, "read_messages", { channel_id: FORUM });
+    expect(read.isError).toBe(true);
+    expect(read.content[0]!.text).toContain("list_threads");
+  });
+});
+
+describe("view_image", () => {
+  const withImage = { ...message, attachments: [{ url: CDN, filename: "memo.png", content_type: "image/png" }] };
+
+  it("returns an image content block and never sends the token to the CDN", async () => {
+    const { client, calls } = fakeDiscord((c) => (c.url.startsWith("https://cdn.discordapp.com") ? imageResponse(PNG) : json(withImage)));
+    const result = (await callTool(client, "view_image", { channel_id: CHANNEL, message_id: MESSAGE })) as unknown as {
+      isError?: boolean;
+      content: { type: string; data?: string; mimeType?: string; text?: string }[];
+    };
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0]!.text).toContain("memo.png");
+    expect(result.content[1]).toEqual({ type: "image", data: btoa(String.fromCharCode(...PNG)), mimeType: "image/png" });
+    expect(calls[1]!.url).toBe(CDN);
+  });
+
+  it("sends no Authorization header to the CDN", async () => {
+    const seen: (RequestInit | undefined)[] = [];
+    const client = new DiscordClient({
+      token: "secret-token",
+      fetch: async (url, init) => {
+        if (url.startsWith("https://cdn.discordapp.com")) {
+          seen.push(init);
+          return imageResponse(PNG);
+        }
+        return json(withImage);
+      },
+    });
+    await callTool(client, "view_image", { channel_id: CHANNEL, message_id: MESSAGE });
+    expect(JSON.stringify(seen[0]!.headers)).not.toContain("secret-token");
+    expect(seen[0]!.redirect).toBe("manual");
+  });
+
+  it("downscales through the media proxy when the original is too large", async () => {
+    const big = new Uint8Array(4_000_000);
+    const { client, calls } = fakeDiscord((c) => {
+      if (c.url.startsWith("https://media.discordapp.net")) return imageResponse(PNG, "image/webp");
+      if (c.url.startsWith("https://cdn.discordapp.com")) return imageResponse(big);
+      return json(withImage);
+    });
+    const result = await callTool(client, "view_image", { channel_id: CHANNEL, message_id: MESSAGE });
+    expect(result.isError).toBeFalsy();
+    expect(result.content[0]!.text).toContain("downscaled");
+    expect(calls[2]!.url).toContain("width=1600");
+  });
+
+  it("reports messages without images and bad indexes", async () => {
+    const none = fakeDiscord(() => json(message));
+    expect((await callTool(none.client, "view_image", { channel_id: CHANNEL, message_id: MESSAGE })).content[0]!.text).toContain("no images");
+    const some = fakeDiscord(() => json(withImage));
+    expect((await callTool(some.client, "view_image", { channel_id: CHANNEL, message_id: MESSAGE, index: 3 })).content[0]!.text).toContain("index must be 0 to 0");
+  });
+
+  it("refuses non-Discord hosts and non-image files", async () => {
+    const evil = fakeDiscord(() => json({ ...message, attachments: [{ url: "https://evil.example/a.png", content_type: "image/png" }] }));
+    const refused = await callTool(evil.client, "view_image", { channel_id: CHANNEL, message_id: MESSAGE });
+    expect(refused.isError).toBe(true);
+    expect(evil.calls.length).toBe(1);
+
+    const html = fakeDiscord((c) => (c.url.startsWith("https://cdn.discordapp.com") ? new Response("<html>", { headers: { "Content-Type": "text/html" } }) : json(withImage)));
+    expect((await callTool(html.client, "view_image", { channel_id: CHANNEL, message_id: MESSAGE })).content[0]!.text).toContain("not a PNG");
+  });
+
+  it("opens link-preview images from embeds and lists them in read_messages", async () => {
+    const proxy = "https://images-ext-1.discordapp.net/external/abc/https/example.com/pic.jpg";
+    const embedded = { ...message, embeds: [{ type: "image", thumbnail: { url: "https://example.com/pic.jpg", proxy_url: proxy } }] };
+    const { client, calls } = fakeDiscord((c) => (c.url === proxy ? imageResponse(PNG, "image/jpeg") : json(c.url.includes("/messages?") ? [embedded] : embedded)));
+    const listed = await callTool(client, "read_messages", { channel_id: CHANNEL });
+    expect(JSON.parse(listed.content[0]!.text.split("\n")[1]!).embed_images).toEqual([proxy]);
+    const result = await callTool(client, "view_image", { channel_id: CHANNEL, message_id: MESSAGE });
+    expect(result.isError).toBeFalsy();
+    expect(calls.at(-1)!.url).toBe(proxy);
+  });
+});

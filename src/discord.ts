@@ -25,6 +25,19 @@ export interface User {
 export interface Attachment {
   url: string;
   filename?: string;
+  content_type?: string;
+  size?: number;
+}
+
+export interface EmbedMedia {
+  url?: string;
+  proxy_url?: string;
+}
+
+export interface Embed {
+  type?: string;
+  image?: EmbedMedia;
+  thumbnail?: EmbedMedia;
 }
 
 export interface Message {
@@ -36,9 +49,9 @@ export interface Message {
   timestamp: string;
   edited_timestamp?: string | null;
   attachments?: Attachment[];
-  embeds?: unknown[];
+  embeds?: Embed[];
   message_reference?: { message_id?: string; channel_id?: string; type?: number };
-  message_snapshots?: { message?: { content?: string; attachments?: Attachment[]; embeds?: unknown[] } }[];
+  message_snapshots?: { message?: { content?: string; attachments?: Attachment[]; embeds?: Embed[] } }[];
 }
 
 export interface Guild {
@@ -54,6 +67,38 @@ export interface Channel {
   position?: number;
   last_message_id?: string | null;
   recipients?: User[];
+  guild_id?: string;
+  owner_id?: string;
+  flags?: number;
+  message_count?: number;
+  available_tags?: { id: string; name: string }[];
+  applied_tags?: string[];
+  thread_metadata?: { archived?: boolean; locked?: boolean; create_timestamp?: string | null };
+}
+
+export interface ThreadSearchResult {
+  threads: Channel[];
+  firstMessages: Message[];
+  hasMore: boolean;
+  totalResults?: number;
+}
+
+export interface FetchedImage {
+  bytes: Uint8Array;
+  mimeType: string;
+}
+
+const IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+/** Hosts an image may be fetched from: Discord's own CDN and media proxy only. */
+export function isDiscordMediaUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:") return false;
+    return url.hostname === "cdn.discordapp.com" || url.hostname === "media.discordapp.net" || url.hostname.endsWith(".discordapp.net");
+  } catch {
+    return false;
+  }
 }
 
 type Fetch = (input: string, init?: RequestInit) => Promise<Response>;
@@ -158,6 +203,71 @@ export class DiscordClient {
     return this.request<Channel[]>("GET", `/guilds/${guildId}/channels`);
   }
 
+  getChannel(channelId: string): Promise<Channel> {
+    return this.request<Channel>("GET", `/channels/${channelId}`);
+  }
+
+  /**
+   * Threads (forum posts) of a forum or media channel, most recently active
+   * first, archived ones included. This is the search endpoint the official
+   * client uses; if Discord refuses it, fall back to the guild's active threads.
+   */
+  async searchThreads(channel: Channel, options: { limit: number; offset: number }): Promise<ThreadSearchResult> {
+    try {
+      const result = await this.request<{
+        threads?: Channel[];
+        first_messages?: Message[];
+        has_more?: boolean;
+        total_results?: number;
+      }>("GET", `/channels/${channel.id}/threads/search`, {
+        query: { sort_by: "last_message_time", sort_order: "desc", limit: options.limit, offset: options.offset, tag_setting: "match_some" },
+      });
+      return {
+        threads: result.threads ?? [],
+        firstMessages: result.first_messages ?? [],
+        hasMore: result.has_more ?? false,
+        totalResults: result.total_results,
+      };
+    } catch (error) {
+      if (!(error instanceof DiscordError) || ![401, 403, 404, 405].includes(error.status ?? 0) || !channel.guild_id) throw error;
+      const active = await this.request<{ threads?: Channel[] }>("GET", `/guilds/${channel.guild_id}/threads/active`);
+      const threads = (active.threads ?? [])
+        .filter((t) => t.parent_id === channel.id)
+        .sort((a, b) => (BigInt(b.last_message_id ?? b.id) > BigInt(a.last_message_id ?? a.id) ? 1 : -1));
+      return { threads: threads.slice(options.offset, options.offset + options.limit), firstMessages: [], hasMore: threads.length > options.offset + options.limit };
+    }
+  }
+
+  /**
+   * Download an image from Discord's CDN. Sent WITHOUT the account token, only
+   * to Discord media hosts, and never through redirects.
+   */
+  async fetchImage(url: string, maxBytes: number): Promise<FetchedImage> {
+    if (!isDiscordMediaUrl(url)) throw new DiscordError("Refused: only images hosted on Discord's CDN can be opened.");
+    let response: Response;
+    try {
+      response = await this.fetchImpl(url, { method: "GET", redirect: "manual", headers: { "User-Agent": USER_AGENT } });
+    } catch {
+      throw new DiscordError("Network error downloading the image from Discord's CDN. Try again in a moment.");
+    }
+    if (!response.ok) {
+      throw new DiscordError(
+        response.status === 403 || response.status === 404
+          ? `The image link is no longer valid (HTTP ${response.status}). Discord links expire; call get_message again for a fresh one.`
+          : `Discord's CDN returned HTTP ${response.status} for the image.`,
+        response.status,
+      );
+    }
+    const mimeType = (response.headers.get("Content-Type") ?? "").split(";")[0]!.trim().toLowerCase();
+    if (!IMAGE_TYPES.has(mimeType)) {
+      throw new DiscordError(`That file is ${mimeType || "an unknown type"}, not a PNG, JPEG, GIF or WebP image, so it cannot be shown.`);
+    }
+    const declared = Number(response.headers.get("Content-Length"));
+    if (Number.isFinite(declared) && declared > maxBytes) throw new ImageTooLarge(declared);
+    const bytes = await readLimited(response, maxBytes);
+    return { bytes, mimeType };
+  }
+
   listDmChannels(): Promise<Channel[]> {
     return this.request<Channel[]>("GET", "/users/@me/channels");
   }
@@ -209,6 +319,36 @@ export class DiscordClient {
   addReaction(channelId: string, messageId: string, encodedEmoji: string): Promise<void> {
     return this.request<void>("PUT", `/channels/${channelId}/messages/${messageId}/reactions/${encodedEmoji}/@me`);
   }
+}
+
+export class ImageTooLarge extends Error {
+  constructor(readonly size: number) {
+    super(`Image is ${size} bytes`);
+  }
+}
+
+async function readLimited(response: Response, maxBytes: number): Promise<Uint8Array> {
+  const reader = response.body?.getReader();
+  if (!reader) return new Uint8Array(await response.arrayBuffer());
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new ImageTooLarge(total);
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return out;
 }
 
 interface Body {

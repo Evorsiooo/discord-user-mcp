@@ -12,16 +12,22 @@ A small remote MCP server on Cloudflare Workers that lets Claude read and act on
 | Tool | Kind | What it does |
 | --- | --- | --- |
 | `list_guilds` | read-only | Servers the account is in (id, name). |
-| `list_channels` | read-only | `guild_id` → text and announcement channels (id, name, type, category). |
+| `list_channels` | read-only | `guild_id` → text, announcement, forum and media channels (id, name, type, category). |
+| `list_threads` | read-only | `channel_id` of a forum or media channel → its posts, most recently active first, archived included (thread id, name, tags, activity times, message count, first-post preview). Optional `limit` (25, max 100) and `offset`. |
 | `list_dms` | read-only | DM and group DM channels, most recent first (channel id, recipients, last message id). Optional `limit` (default 50). |
 | `read_messages` | read-only | `channel_id`, optional `limit` (25, max 100), optional `before`. Returns oldest → newest. Text over 700 chars is truncated. |
 | `get_message` | read-only | One message, full text. |
+| `view_image` | read-only | `channel_id`, `message_id`, optional `index`. Returns a message's image (attachment or link-preview image) as an MCP image, so Claude can see it. Images over ~3.5 MB are downscaled through Discord's media proxy. |
 | `send_message` | write | `channel_id`, `content` (≤ 2000), optional `reply_to`. Works for DM channel ids. |
 | `edit_message` | write | Requires `expected_old_text_start`. Refused if it doesn't match the current text. |
 | `delete_message` | write, destructive | Requires `expected_author` and `expected_text_start`. Refused if either doesn't match. |
 | `add_reaction` | write | `emoji` is a unicode emoji or `name:id` for custom. |
 
 The expected-text checks ignore whitespace differences and a trailing `...`. They need at least the first 15 characters, or the whole text if it is shorter. For a message with no text, pass an empty string.
+
+Forum posts: a post is a thread, so `read_messages` works on its `thread_id` (the first message is the post itself). Calling `read_messages` on the forum channel itself fails with a hint to use `list_threads`.
+
+Images: `read_messages` and `get_message` list a message's `attachments` and, for link previews, `embed_images`. `view_image` indexes through that list (attachments first), fetches only from Discord's CDN hosts, never sends the account token there, and does not follow redirects. Discord's signed links expire, so `view_image` re-fetches the message each time.
 
 How the server talks to Discord:
 - On HTTP 429 it waits `retry_after` (up to 30 s) and retries once, then returns a clear error.
@@ -56,7 +62,7 @@ Check it with curl. The first command should print `401`:
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8787/mcp
 ```
 
-With the right header, the second command should list nine tools:
+With the right header, the second command should list eleven tools:
 
 ```sh
 SECRET=$(grep ^SERVER_SECRET= .dev.vars | cut -d= -f2-)
@@ -117,6 +123,9 @@ npx wrangler delete
 This deletes the Worker and its secrets. Then remove the connector in Claude, and change the Discord account's password to kill the token.
 
 ## Unverified against the live API
+
+- `list_threads` uses `GET /channels/{id}/threads/search`, the endpoint the official client uses. If Discord refuses it, the server falls back to the guild's active threads (archived posts are then missing).
+- `view_image` downscales large images by switching to `media.discordapp.net` with `width`, `height` and `format` parameters.
 
 Discord's docs cover bots only. These behaviors were built from the bot docs and could not be checked against a real user account during development:
 
