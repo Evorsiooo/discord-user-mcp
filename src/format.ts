@@ -1,6 +1,6 @@
 // Pure helpers: message shaping, expected-text checks, emoji encoding.
 
-import type { Attachment, Channel, Message, User } from "./discord";
+import { isDiscordMediaUrl, type Attachment, type Channel, type Embed, type Message, type User } from "./discord";
 
 const MAX_ATTACHMENTS = 10;
 
@@ -11,9 +11,30 @@ export interface FormattedMessage {
   author: { id: string; username: string; display_name?: string };
   content: string;
   reply_to?: string;
-  forwarded?: { content: string; attachments?: string[] };
+  forwarded?: { content: string; attachments?: string[]; embeds?: FormattedEmbed[] };
   attachments?: string[];
-  embeds?: number;
+  embed_images?: string[];
+  embeds?: FormattedEmbed[];
+}
+
+export interface FormattedEmbed {
+  type?: string;
+  author?: string;
+  title?: string;
+  url?: string;
+  description?: string;
+  fields?: { name: string; value: string }[];
+  more_fields?: number;
+  footer?: string;
+  timestamp?: string;
+}
+
+const MAX_EMBEDS = 10;
+
+const DISCORD_EPOCH_MS = 1420070400000n;
+
+export function snowflakeTime(id: string): string {
+  return new Date(Number((BigInt(id) >> 22n) + DISCORD_EPOCH_MS)).toISOString();
 }
 
 export function truncate(text: string, max: number): string {
@@ -49,13 +70,75 @@ export function formatMessage(message: Message, maxContent: number): FormattedMe
   const snapshot = message.message_snapshots?.[0]?.message;
   if (snapshot) {
     out.forwarded = { content: truncate(snapshot.content ?? "", maxContent) };
+    const forwardedEmbeds = formatEmbeds(snapshot.embeds, maxContent);
+    if (forwardedEmbeds) out.forwarded.embeds = forwardedEmbeds;
     const forwardedAttachments = attachmentUrls(snapshot.attachments);
     if (forwardedAttachments) out.forwarded.attachments = forwardedAttachments;
   }
   const attachments = attachmentUrls(message.attachments);
   if (attachments) out.attachments = attachments;
-  if (message.embeds?.length) out.embeds = message.embeds.length;
+  const embedImages = embedImageUrls(message.embeds);
+  if (embedImages.length) out.embed_images = embedImages;
+  const embeds = formatEmbeds(message.embeds, maxContent);
+  if (embeds) out.embeds = embeds;
   return out;
+}
+
+/**
+ * Embeds carry the text of bot and webhook posts (announcements, logs, link
+ * previews), so return it. Embeds with no text, such as bare image previews,
+ * are skipped here; their pictures still appear in embed_images.
+ */
+function formatEmbeds(embeds: Embed[] | undefined, maxContent: number): FormattedEmbed[] | undefined {
+  const full = maxContent >= 4000;
+  const maxFields = full ? 25 : 10;
+  const maxField = Math.min(maxContent, 1024);
+  const out: FormattedEmbed[] = [];
+  for (const embed of embeds ?? []) {
+    const item: FormattedEmbed = {};
+    if (embed.type && embed.type !== "rich") item.type = embed.type;
+    if (embed.author?.name) item.author = embed.author.name;
+    if (embed.title) item.title = truncate(embed.title, 300);
+    if (embed.url) item.url = embed.url;
+    if (embed.description) item.description = truncate(embed.description, maxContent);
+    const fields = (embed.fields ?? []).filter((f) => f.name || f.value);
+    if (fields.length) {
+      item.fields = fields.slice(0, maxFields).map((f) => ({ name: truncate(f.name ?? "", 256), value: truncate(f.value ?? "", maxField) }));
+      if (fields.length > maxFields) item.more_fields = fields.length - maxFields;
+    }
+    if (embed.footer?.text) item.footer = truncate(embed.footer.text, 300);
+    if (embed.timestamp) item.timestamp = isoTimestamp(embed.timestamp);
+    const hasText = item.author || item.title || item.description || item.fields || item.footer;
+    if (hasText) out.push(item);
+    if (out.length === MAX_EMBEDS) break;
+  }
+  return out.length ? out : undefined;
+}
+
+function embedImageUrls(embeds: Embed[] | undefined): string[] {
+  const urls: string[] = [];
+  for (const embed of embeds ?? []) {
+    // proxy_url is hosted by Discord; the original url can point anywhere.
+    const media = embed.image ?? embed.thumbnail;
+    const url = media?.proxy_url ?? media?.url;
+    if (url && isDiscordMediaUrl(url) && !urls.includes(url)) urls.push(url);
+  }
+  return urls;
+}
+
+/**
+ * Every image a message carries, in the order view_image indexes them:
+ * file attachments first, then images from link embeds.
+ */
+export function messageImages(message: Message): { url: string; source: "attachment" | "embed"; label: string }[] {
+  const images: { url: string; source: "attachment" | "embed"; label: string }[] = [];
+  for (const a of message.attachments ?? []) {
+    if (a.content_type ? a.content_type.startsWith("image/") : /\.(png|jpe?g|gif|webp)(\?|$)/i.test(a.url)) {
+      images.push({ url: a.url, source: "attachment", label: a.filename ?? "attachment" });
+    }
+  }
+  for (const url of embedImageUrls(message.embeds)) images.push({ url, source: "embed", label: "embedded image" });
+  return images;
 }
 
 /** Discord ids are snowflakes; compare them numerically. */
@@ -79,7 +162,7 @@ export function formatDm(channel: Channel) {
   };
 }
 
-const CHANNEL_TYPES: Record<number, string> = { 0: "text", 5: "announcement" };
+const CHANNEL_TYPES: Record<number, string> = { 0: "text", 5: "announcement", 15: "forum", 16: "media" };
 
 export function formatGuildChannels(channels: Channel[]) {
   const categories = new Map<string, Channel>();
@@ -94,6 +177,27 @@ export function formatGuildChannels(channels: Channel[]) {
       type: CHANNEL_TYPES[c.type]!,
       category: c.parent_id ? (categories.get(c.parent_id)?.name ?? null) : null,
     }));
+}
+
+export function formatThread(thread: Channel, tagNames: Map<string, string>, firstMessage?: Message) {
+  const tags = (thread.applied_tags ?? []).map((id) => tagNames.get(id) ?? id);
+  const last = thread.last_message_id ?? thread.id;
+  return {
+    thread_id: thread.id,
+    name: thread.name ?? "",
+    ...(tags.length && { tags }),
+    created: thread.thread_metadata?.create_timestamp ?? snowflakeTime(thread.id),
+    last_activity: snowflakeTime(last),
+    ...(thread.message_count !== undefined && { messages: thread.message_count }),
+    ...(thread.thread_metadata?.archived && { archived: true }),
+    ...(thread.thread_metadata?.locked && { locked: true }),
+    ...((thread.flags ?? 0) & 2 ? { pinned: true } : {}),
+    ...(firstMessage && {
+      started_by: firstMessage.author.username,
+      first_post: truncate(firstMessage.content ?? "", 200),
+      ...(firstMessage.attachments?.length ? { first_post_attachments: firstMessage.attachments.length } : {}),
+    }),
+  };
 }
 
 const MIN_EXPECTED_CHARS = 15;
@@ -149,4 +253,10 @@ export function encodeEmoji(input: string): string {
     throw new Error(`"${s}" is not an emoji. Pass a unicode emoji character, or name:id for a custom emoji.`);
   }
   return encodeURIComponent(s);
+}
+
+export function toBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
 }
