@@ -36,6 +36,13 @@ export interface EmbedMedia {
 
 export interface Embed {
   type?: string;
+  url?: string;
+  title?: string;
+  description?: string;
+  timestamp?: string;
+  author?: { name?: string };
+  footer?: { text?: string };
+  fields?: { name?: string; value?: string }[];
   image?: EmbedMedia;
   thumbnail?: EmbedMedia;
 }

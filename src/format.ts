@@ -11,11 +11,25 @@ export interface FormattedMessage {
   author: { id: string; username: string; display_name?: string };
   content: string;
   reply_to?: string;
-  forwarded?: { content: string; attachments?: string[] };
+  forwarded?: { content: string; attachments?: string[]; embeds?: FormattedEmbed[] };
   attachments?: string[];
   embed_images?: string[];
-  embeds?: number;
+  embeds?: FormattedEmbed[];
 }
+
+export interface FormattedEmbed {
+  type?: string;
+  author?: string;
+  title?: string;
+  url?: string;
+  description?: string;
+  fields?: { name: string; value: string }[];
+  more_fields?: number;
+  footer?: string;
+  timestamp?: string;
+}
+
+const MAX_EMBEDS = 10;
 
 const DISCORD_EPOCH_MS = 1420070400000n;
 
@@ -56,6 +70,8 @@ export function formatMessage(message: Message, maxContent: number): FormattedMe
   const snapshot = message.message_snapshots?.[0]?.message;
   if (snapshot) {
     out.forwarded = { content: truncate(snapshot.content ?? "", maxContent) };
+    const forwardedEmbeds = formatEmbeds(snapshot.embeds, maxContent);
+    if (forwardedEmbeds) out.forwarded.embeds = forwardedEmbeds;
     const forwardedAttachments = attachmentUrls(snapshot.attachments);
     if (forwardedAttachments) out.forwarded.attachments = forwardedAttachments;
   }
@@ -63,8 +79,40 @@ export function formatMessage(message: Message, maxContent: number): FormattedMe
   if (attachments) out.attachments = attachments;
   const embedImages = embedImageUrls(message.embeds);
   if (embedImages.length) out.embed_images = embedImages;
-  if (message.embeds?.length) out.embeds = message.embeds.length;
+  const embeds = formatEmbeds(message.embeds, maxContent);
+  if (embeds) out.embeds = embeds;
   return out;
+}
+
+/**
+ * Embeds carry the text of bot and webhook posts (announcements, logs, link
+ * previews), so return it. Embeds with no text, such as bare image previews,
+ * are skipped here; their pictures still appear in embed_images.
+ */
+function formatEmbeds(embeds: Embed[] | undefined, maxContent: number): FormattedEmbed[] | undefined {
+  const full = maxContent >= 4000;
+  const maxFields = full ? 25 : 10;
+  const maxField = Math.min(maxContent, 1024);
+  const out: FormattedEmbed[] = [];
+  for (const embed of embeds ?? []) {
+    const item: FormattedEmbed = {};
+    if (embed.type && embed.type !== "rich") item.type = embed.type;
+    if (embed.author?.name) item.author = embed.author.name;
+    if (embed.title) item.title = truncate(embed.title, 300);
+    if (embed.url) item.url = embed.url;
+    if (embed.description) item.description = truncate(embed.description, maxContent);
+    const fields = (embed.fields ?? []).filter((f) => f.name || f.value);
+    if (fields.length) {
+      item.fields = fields.slice(0, maxFields).map((f) => ({ name: truncate(f.name ?? "", 256), value: truncate(f.value ?? "", maxField) }));
+      if (fields.length > maxFields) item.more_fields = fields.length - maxFields;
+    }
+    if (embed.footer?.text) item.footer = truncate(embed.footer.text, 300);
+    if (embed.timestamp) item.timestamp = isoTimestamp(embed.timestamp);
+    const hasText = item.author || item.title || item.description || item.fields || item.footer;
+    if (hasText) out.push(item);
+    if (out.length === MAX_EMBEDS) break;
+  }
+  return out.length ? out : undefined;
 }
 
 function embedImageUrls(embeds: Embed[] | undefined): string[] {

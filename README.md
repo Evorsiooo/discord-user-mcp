@@ -15,8 +15,8 @@ A small remote MCP server on Cloudflare Workers that lets Claude read and act on
 | `list_channels` | read-only | `guild_id` → text, announcement, forum and media channels (id, name, type, category). |
 | `list_threads` | read-only | `channel_id` of a forum or media channel → its posts, most recently active first, archived included (thread id, name, tags, activity times, message count, first-post preview). Optional `limit` (25, max 100) and `offset`. |
 | `list_dms` | read-only | DM and group DM channels, most recent first (channel id, recipients, last message id). Optional `limit` (default 50). |
-| `read_messages` | read-only | `channel_id`, optional `limit` (25, max 100), optional `before`. Returns oldest → newest. Text over 700 chars is truncated. |
-| `get_message` | read-only | One message, full text. |
+| `read_messages` | read-only | `channel_id`, optional `limit` (25, max 100), optional `before`. Returns oldest → newest, with embed text (bot and webhook posts) included. Text over 700 chars is truncated. |
+| `get_message` | read-only | One message, full text and full embeds. |
 | `view_image` | read-only | `channel_id`, `message_id`, optional `index`. Returns a message's image (attachment or link-preview image) as an MCP image, so Claude can see it. Images over ~3.5 MB are downscaled through Discord's media proxy. |
 | `send_message` | write | `channel_id`, `content` (≤ 2000), optional `reply_to`. Works for DM channel ids. |
 | `edit_message` | write | Requires `expected_old_text_start`. Refused if it doesn't match the current text. |
@@ -26,6 +26,8 @@ A small remote MCP server on Cloudflare Workers that lets Claude read and act on
 The expected-text checks ignore whitespace differences and a trailing `...`. They need at least the first 15 characters, or the whole text if it is shorter. For a message with no text, pass an empty string.
 
 Forum posts: a post is a thread, so `read_messages` works on its `thread_id` (the first message is the post itself). Calling `read_messages` on the forum channel itself fails with a hint to use `list_threads`.
+
+Embeds: bot, webhook and link-preview posts keep their text in embeds. `read_messages` and `get_message` return each embed's author, title, link, description, fields, footer and timestamp as `embeds`. Embeds with no text, such as bare image previews, are skipped there; their pictures are in `embed_images`. Lists cap each embed at 700 characters and 10 fields; `get_message` returns up to 4000 characters and 25 fields.
 
 Images: `read_messages` and `get_message` list a message's `attachments` and, for link previews, `embed_images`. `view_image` indexes through that list (attachments first), fetches only from Discord's CDN hosts, never sends the account token there, and does not follow redirects. Discord's signed links expire, so `view_image` re-fetches the message each time.
 

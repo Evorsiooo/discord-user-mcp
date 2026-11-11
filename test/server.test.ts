@@ -374,3 +374,69 @@ describe("view_image", () => {
     expect(calls.at(-1)!.url).toBe(proxy);
   });
 });
+
+describe("embeds", () => {
+  const embedded: Message = {
+    ...message,
+    content: "",
+    embeds: [
+      {
+        type: "rich",
+        author: { name: "Harrison Bot" },
+        title: "Council Ordinance 3-43",
+        url: "https://example.com/co-3-43",
+        description: "The ordinance was **vetoed** and returned to the council.",
+        timestamp: "2026-10-22T01:49:38.864000+00:00",
+        footer: { text: "Office of the County Executive" },
+        fields: [
+          { name: "Status", value: "Vetoed" },
+          { name: "Sponsor", value: "Council" },
+        ],
+      },
+      { type: "image", thumbnail: { url: "https://cdn.discordapp.com/x.png", proxy_url: "https://media.discordapp.net/x.png" } },
+    ],
+  };
+
+  it("returns embed text from read_messages and get_message, skipping image-only embeds", async () => {
+    const { client } = fakeDiscord((c) => json(c.url.includes("/messages?") ? [embedded] : embedded));
+    const listed = JSON.parse((await callTool(client, "read_messages", { channel_id: CHANNEL })).content[0]!.text.split("\n")[1]!);
+    expect(listed.embeds).toEqual([
+      {
+        author: "Harrison Bot",
+        title: "Council Ordinance 3-43",
+        url: "https://example.com/co-3-43",
+        description: "The ordinance was **vetoed** and returned to the council.",
+        fields: [
+          { name: "Status", value: "Vetoed" },
+          { name: "Sponsor", value: "Council" },
+        ],
+        footer: "Office of the County Executive",
+        timestamp: "2026-10-22T01:49:38.864Z",
+      },
+    ]);
+    expect(listed.embed_images).toEqual(["https://media.discordapp.net/x.png"]);
+
+    const single = JSON.parse((await callTool(client, "get_message", { channel_id: CHANNEL, message_id: MESSAGE })).content[0]!.text);
+    expect(single.embeds[0].title).toBe("Council Ordinance 3-43");
+  });
+
+  it("truncates long embed text in lists but not in get_message", async () => {
+    const long: Message = { ...message, embeds: [{ description: "d".repeat(3000), fields: Array.from({ length: 14 }, (_, i) => ({ name: `f${i}`, value: "v" })) }] };
+    const { client } = fakeDiscord((c) => json(c.url.includes("/messages?") ? [long] : long));
+    const listed = JSON.parse((await callTool(client, "read_messages", { channel_id: CHANNEL })).content[0]!.text.split("\n")[1]!);
+    expect(listed.embeds[0].description.length).toBeLessThan(900);
+    expect(listed.embeds[0].fields.length).toBe(10);
+    expect(listed.embeds[0].more_fields).toBe(4);
+
+    const single = JSON.parse((await callTool(client, "get_message", { channel_id: CHANNEL, message_id: MESSAGE })).content[0]!.text);
+    expect(single.embeds[0].description.length).toBe(3000);
+    expect(single.embeds[0].fields.length).toBe(14);
+  });
+
+  it("includes embeds of forwarded messages", async () => {
+    const forwarded: Message = { ...message, message_snapshots: [{ message: { content: "fwd", embeds: [{ title: "Inside" }] } }] };
+    const { client } = fakeDiscord(() => json(forwarded));
+    const single = JSON.parse((await callTool(client, "get_message", { channel_id: CHANNEL, message_id: MESSAGE })).content[0]!.text);
+    expect(single.forwarded.embeds).toEqual([{ title: "Inside" }]);
+  });
+});
